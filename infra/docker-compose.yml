@@ -1,3 +1,5 @@
+# infra/docker-compose.yml
+
 services:
   redpanda:
     image: redpandadata/redpanda:v24.2.7
@@ -39,6 +41,67 @@ services:
       - "5432:5432"
     volumes:
       - sentiment_pgdata:/var/lib/postgresql/data
+
+  # --- App services ---
+
+  collector:
+    build:
+      context: ..
+      dockerfile: services/collector/Dockerfile
+    container_name: sentiment_collector
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      TOPIC_RAW_POSTS: raw.posts
+    depends_on:
+      - redpanda
+
+  enricher:
+    build:
+      context: ..
+      dockerfile: services/enricher/Dockerfile
+    container_name: sentiment_enricher
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      TOPIC_RAW_POSTS: raw.posts
+      TOPIC_ENRICHED_POSTS: enriched.posts
+    depends_on:
+      - redpanda
+      - collector
+
+  aggregator:
+    build:
+      context: ..
+      dockerfile: services/aggregator/Dockerfile
+    container_name: sentiment_aggregator
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      TOPIC_ENRICHED_POSTS: enriched.posts
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: sentiment
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    depends_on:
+      - redpanda
+      - postgres
+      - enricher
+
+  api:
+    build:
+      context: ..
+      dockerfile: services/api/Dockerfile
+    container_name: sentiment_api
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: sentiment
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - aggregator
 
 volumes:
   sentiment_pgdata:
