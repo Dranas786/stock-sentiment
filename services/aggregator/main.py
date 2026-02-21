@@ -103,3 +103,6 @@ def upsert_aggregate(
         )
 
     print(f"Aggregated ticker {ticker} at {bucket}")
+
+if __name__ == "__main__":
+    main()

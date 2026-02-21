@@ -129,3 +129,6 @@ def main() -> None:
         )
 
         print(f"Enriched post {raw_post.post_id} with tickers {tickers}")
+
+if __name__ == "__main__":
+    main()

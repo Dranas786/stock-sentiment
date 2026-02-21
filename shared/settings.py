@@ -28,20 +28,16 @@ class Settings(BaseSettings):
     POSTGRES_USER: str = Field(default="app")
     POSTGRES_PASSWORD: str = Field(default="app")
 
-    # SQLAlchemy async URL (FastAPI can use it; workers can use sync if you prefer)
-    @property
-    def DATABASE_URL_ASYNC(self) -> str:
-        return (
-            f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
-            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
-        )
+    # (FastAPI can use it; workers can use sync if you prefer)
 
     @property
     def DATABASE_URL_SYNC(self) -> str:
+        # psycopg.connect() wants a normal PostgreSQL URI (NO "postgresql+psycopg://")
         return (
-            f"postgresql+psycopg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
+            f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
+
 
 
 settings = Settings()
