@@ -144,9 +144,9 @@ def main() -> None:
     print(f"[collector] Started. Poll interval={poll_s}s. Producing to topic={settings.TOPIC_RAW_POSTS}")
 
     while True:
-        try:
-            # ---------------- Reddit ingestion ----------------
-            if reddit:
+        # ---------------- Reddit ingestion ----------------
+        if reddit:
+            try:
                 for sr in reddit_subreddits:
                     key = CursorKey(source="reddit", stream_id=f"reddit:{sr}")
                     last_fullname = cursor_store.get_cursor(key)
@@ -165,9 +165,14 @@ def main() -> None:
                     if newest_seen and newest_seen != last_fullname:
                         cursor_store.set_cursor(key, newest_seen)
 
-            # ---------------- News ingestion ----------------
-            if news:
-                # We treat the whole query list as one stream cursor
+            except Exception as e:
+                # Isolate reddit failures (auth, rate limits, etc.)
+                print(f"[collector][reddit] ERROR: {type(e).__name__}: {e}")
+
+        # ---------------- News ingestion ----------------
+        if news:
+            try:
+                # Treat the whole query list as one stream cursor
                 key = CursorKey(source="news", stream_id="news:default")
                 last_iso = cursor_store.get_cursor(key)
 
@@ -185,11 +190,12 @@ def main() -> None:
                 if newest_iso and newest_iso != last_iso:
                     cursor_store.set_cursor(key, newest_iso)
 
-        except Exception as e:
-            # Don't crash the container; log and retry next poll
-            print(f"[collector] ERROR: {type(e).__name__}: {e}")
+            except Exception as e:
+                # Isolate news failures (bad key, quota, etc.)
+                print(f"[collector][news] ERROR: {type(e).__name__}: {e}")
 
         time.sleep(poll_s)
+
 
 
 if __name__ == "__main__":
