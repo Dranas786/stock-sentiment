@@ -35,38 +35,69 @@ class RawPost(BaseModel):
         return v
 
 
+
+# Widen flags so we don't fight the model pipeline.
+EnrichedFlag = Literal[
+    "low_confidence",
+    "no_ticker",
+    "non_english",
+    "neutral",
+    "low_signal",
+    "empty_text",
+    "duplicate",
+]
+
+
 class EnrichedPost(BaseModel):
     """
-    Output of the NLP enricher worker, published to TOPIC_ENRICHED_POSTS.
+    Output of the HF enricher worker, published to TOPIC_ENRICHED_POSTS.
     """
 
+    # Identity
     source: str
     post_id: str
     created_at: datetime
+
+    # Carry-through content
     text: str
+    author: Optional[str] = None
+    url: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
 
-    tickers: List[str] = Field(default_factory=list, description="Extracted tickers like ['AAPL']")
-    language: Optional[str] = Field(default=None, description="ISO language code if detected")
+    # Entities
+    tickers: List[str] = Field(default_factory=list)
+    language: Optional[str] = None
 
-    # Sentiment in range [-1, 1] (convention). Keep it consistent across the project.
-    sentiment: float = Field(..., ge=-1.0, le=1.0)
+    # Finance sentiment (FinBERT)
+    finbert_pos: float = 0.0
+    finbert_neg: float = 0.0
+    finbert_neutral: float = 0.0
+    finbert_score: float = Field(0.0, ge=-1.0, le=1.0)  # pos - neg
 
-    # Emotion scores in range [0, 1], do not force they sum to 1 unless your model guarantees it
+    # Emotions (model-dependent labels, probs typically [0,1])
     emotions: Dict[str, float] = Field(default_factory=dict)
 
-    # Confidence in [0, 1] for the enrichment output as a whole
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Stance / intent (zero-shot)
+    stance_label: str = "neutral"
+    stance_confidence: float = Field(0.0, ge=0.0, le=1.0)
+    stance_probs: Dict[str, float] = Field(default_factory=dict)
 
-    # Optional flags for downstream aggregation / filtering
-    flags: List[Literal["low_confidence", "no_ticker", "non_english"]] = Field(default_factory=list)
+    # Derived signals
+    conviction: float = Field(0.0, ge=0.0, le=1.0)
+    source_weight: float = Field(1.0, ge=0.0)
+    dedup_key: str = ""
 
-    @field_validator("created_at")
+    # Overall confidence (you can keep using it; for HF version we can set it from stance_confidence etc.)
+    confidence: float = Field(0.5, ge=0.0, le=1.0)
+
+    flags: List[EnrichedFlag] = Field(default_factory=list)
+
+    enriched_at: datetime = Field(default_factory=utcnow)
+
+    @field_validator("created_at", "enriched_at")
     @classmethod
     def ensure_tz_aware(cls, v: datetime) -> datetime:
-        if v.tzinfo is None:
-            return v.replace(tzinfo=timezone.utc)
-        return v
-
+        return v if v.tzinfo is not None else v.replace(tzinfo=timezone.utc)
 
 def to_jsonable_dict(model: BaseModel) -> Dict[str, Any]:
     """

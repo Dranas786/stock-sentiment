@@ -10,6 +10,12 @@ pydantic-settings==2.2.1
 
 python-dotenv==1.0.1
 
-# --- new: external sources ---
 praw==7.8.1
 requests==2.32.3
+
+# --- Hugging Face / NLP (best-quality enrichment) ---
+transformers==4.44.2
+torch==2.4.1
+accelerate==0.33.0
+sentencepiece==0.2.0
+tokenizers==0.19.1
