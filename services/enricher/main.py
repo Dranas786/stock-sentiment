@@ -17,58 +17,81 @@ from shared.settings import settings
 from shared.schemas import RawPost, EnrichedPost, to_jsonable_dict
 
 from services.enricher.models import HFModels, normalize_text, make_conviction_score
+from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[2]   # /repo/services/enricher/main.py -> parents[2] == /repo
+SYMBOLS_PATH = Path(os.getenv("SYMBOLS_PATH", str(REPO_ROOT / "shared" / "symbols.txt")))
 
-# --- Ticker extraction (entity-linking friendly) ---
-CASHTAG_PATTERN = re.compile(r"(?<![A-Z0-9])\$?([A-Z]{1,5})(?![A-Z0-9])")
-STOP_TOKENS = {
-    "A", "I", "THE", "THIS", "THAT", "IMO", "USA", "GDP", "CEO", "CPI", "FED", "ETF",
-    "YOLO", "DD", "EOD", "ATH", "FOMO", "SEC", "AI", "WSB", "LOL", "LMAO",
-}
+def load_symbol_allowlist(path: Path = SYMBOLS_PATH) -> Optional[Set[str]]:
+    """
+    Returns a set of allowed ticker symbols.
+    Returns None if file doesn't exist -> allowlist disabled (regex-only).
+    """
+    if not path.exists():
+        return None
 
-# Optional allowlist file (recommended for best quality)
-# shared/symbols.txt: one ticker per line (e.g., TSLA, NVDA, AAPL)
-def load_symbol_allowlist() -> Set[str]:
-    here = os.path.dirname(__file__)
-    # repo_root/services/enricher -> repo_root
-    repo_root = os.path.abspath(os.path.join(here, "..", ".."))
-    p = os.path.join(repo_root, "shared", "symbols.txt")
-    if not os.path.exists(p):
-        return set()
-    allow = set()
-    with open(p, "r", encoding="utf-8") as f:
-        for line in f:
-            t = line.strip().upper()
-            if not t or t.startswith("#"):
-                continue
-            allow.add(t)
-    return allow
-
+    symbols: Set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip().upper()
+        if not s or s.startswith("#"):
+            continue
+        symbols.add(s)
+    return symbols
 
 ALLOWLIST = load_symbol_allowlist()
+if ALLOWLIST is None:
+    print(f"[enricher] allowlist disabled (missing {SYMBOLS_PATH})")
+else:
+    print(f"[enricher] loaded allowlist with {len(ALLOWLIST)} symbols")
 
 
-def extract_tickers(text: str) -> List[str]:
-    """
-    High-precision ticker extraction:
-      - supports $TSLA and TSLA tokens
-      - filters stop tokens
-      - if allowlist is present, requires membership (best precision)
-    """
-    t = text.upper()
-    found: Set[str] = set()
+# Example: supports $TSLA and TSLA, 1–5 letters (your current behavior)
+TICKER_RE = re.compile(r"(?<![A-Z])\$?([A-Z]{1,5})(?![A-Z])")
 
-    for m in CASHTAG_PATTERN.finditer(t):
-        sym = m.group(1)
+STOP_TOKENS = {
+    "A", "AN", "AND", "ARE", "AS", "AT",
+    "BE", "BY",
+    "CEO", "CFO", "COO",
+    "FOR", "FROM",
+    "HE", "HER", "HIS",
+    "I", "IN", "IS", "IT",
+    "OF", "ON", "OR", "OUR", "OUT",
+    "THE", "TO",
+    "US", "USA",
+    "WAS", "WE", "WITH", "YOU",
+    "DAY",
+}
+
+def extract_tickers(text: str, allowlist: set[str] | None = ALLOWLIST) -> list[str]:
+    if not text:
+        return []
+
+    candidates = [m.group(1) for m in TICKER_RE.finditer(text.upper())]
+
+    # basic cleanup + stopwords
+    cleaned: list[str] = []
+    for sym in candidates:
         if sym in STOP_TOKENS:
             continue
-        if len(sym) == 1:
-            continue
-        if ALLOWLIST and sym not in ALLOWLIST:
-            continue
-        found.add(sym)
+        # your old rule: 1–5 letters only (already enforced by regex)
+        cleaned.append(sym)
 
-    return sorted(found)
+    if not cleaned:
+        return []
+
+    # allowlist filter (if enabled)
+    if allowlist is not None:
+        cleaned = [s for s in cleaned if s in allowlist]
+
+    # de-dupe while preserving order
+    seen = set()
+    out = []
+    for s in cleaned:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    return out
 
 
 # --- Dedup (prevents news repost spam) ---
@@ -136,12 +159,13 @@ def main() -> None:
         value_deserializer=lambda m: json.loads(m.decode("utf-8")),
         group_id="enricher-group",
         auto_offset_reset="earliest",
-        enable_auto_commit=True,
+        enable_auto_commit=False,
         max_poll_records=200,
     )
 
     producer = KafkaProducer(
         bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
+        key_serializer=lambda k: k.encode("utf-8"),
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         acks="all",
         linger_ms=10,
@@ -151,7 +175,7 @@ def main() -> None:
 
     print(
         f"[enricher] started (batch_size={batch_size}, max_length={max_length}, "
-        f"allowlist={'on' if ALLOWLIST else 'off'})"
+        f"allowlist={'on' if ALLOWLIST is not None else 'off'})"
     )
 
     # Micro-batching from Kafka
@@ -168,7 +192,7 @@ def main() -> None:
         stance = models.stance_batch(texts)
 
         for p, fin_s, emo_d, st in zip(posts, fin, emo, stance):
-            tickers = extract_tickers(p.text or "")
+            tickers = extract_tickers(p.text or "", allowlist=ALLOWLIST)
 
             # Quality/flags (model-driven, explainable)
             flags: List[str] = []
@@ -215,7 +239,11 @@ def main() -> None:
                 enriched_at=utc_now(),
             )
 
-            producer.send(settings.TOPIC_ENRICHED_POSTS, value=to_jsonable_dict(enriched))
+            producer.send(
+                settings.TOPIC_ENRICHED_POSTS,
+                key=p.post_id,
+                value=to_jsonable_dict(enriched),
+            )
 
         producer.flush()
 
@@ -233,6 +261,7 @@ def main() -> None:
 
             if len(buffer) >= batch_size:
                 flush(buffer)
+                consumer.commit()
                 buffer.clear()
 
         except Exception as e:
@@ -240,6 +269,7 @@ def main() -> None:
 
     # If loop ever exits, flush remainder
     flush(buffer)
+    consumer.commit()
 
 
 if __name__ == "__main__":

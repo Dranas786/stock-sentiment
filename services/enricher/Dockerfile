@@ -1,8 +1,7 @@
-# services/enricher/Dockerfile
-
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1
+ENV SYMBOLS_PATH=/app/shared/symbols.txt
 
 WORKDIR /app
 
