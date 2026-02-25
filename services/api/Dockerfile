@@ -9,7 +9,7 @@ WORKDIR /app
 
 # Install deps first (better docker layer caching)
 # COPY pyproject.toml /app/pyproject.toml
-COPY requirements.txt /app/requirements.txt
+COPY services/api/requirements.txt /app/requirements.txt
 
 RUN pip install --no-cache-dir -r requirements.txt
 
