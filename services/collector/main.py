@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
 from typing import List, Optional
 
@@ -17,44 +18,55 @@ from services.collector.reddit_api import RedditAPI, RedditConfig
 from services.collector.news_api import NewsAPI, NewsAPIConfig
 
 
-# -------- Config via env vars (simple MVP style) --------
-#
-# Reddit:
-#   REDDIT_CLIENT_ID
-#   REDDIT_CLIENT_SECRET
-#   REDDIT_USER_AGENT
-#   REDDIT_SUBREDDITS="wallstreetbets,stocks,investing"
-#
-# News:
-#   NEWS_API_KEY
-#   NEWS_QUERIES="NVDA,TSLA,AAPL,AMD,MSFT,stock market,earnings"
-#
-# Polling:
-#   COLLECTOR_POLL_SECONDS=30
-#   REDDIT_LIMIT_PER_SUBREDDIT=50
-#   NEWS_PAGE_SIZE=50
-#
-# Cursor streams:
-#   We store per-stream cursor keys:
-#     reddit:<subreddit>
-#     news:<query-set-hash>  (for now: a single stream for all queries)
-
-
 def _split_csv(env_value: Optional[str]) -> List[str]:
     if not env_value:
         return []
     return [x.strip() for x in env_value.split(",") if x.strip()]
 
 
-def _make_producer() -> KafkaProducer:
-    """
-    Create a Kafka producer with retries for broker readiness.
+def _get_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
-    Note: kafka-python is not a true idempotent producer client, but:
-      - we publish stable keys
-      - we store cursors in Postgres
-      => practical "no-duplicate on resume" behavior.
-    """
+
+def _mode() -> str:
+    return os.getenv("COLLECT_MODE", "slow").strip().lower()
+
+
+def _poll_seconds(kind: str) -> int:
+    m = _mode()
+    if kind == "news":
+        return _get_int("NEWS_POLL_SECONDS_FAST", 600) if m == "fast" else _get_int("NEWS_POLL_SECONDS_SLOW", 3600)
+    if kind == "reddit":
+        return _get_int("REDDIT_POLL_SECONDS_FAST", 60) if m == "fast" else _get_int("REDDIT_POLL_SECONDS_SLOW", 180)
+    return 60
+
+
+def _is_429(err: Exception) -> bool:
+    # requests.HTTPError has .response with .status_code
+    resp = getattr(err, "response", None)
+    return bool(resp is not None and getattr(resp, "status_code", None) == 429)
+
+
+def _retry_after_seconds(err: Exception) -> Optional[int]:
+    resp = getattr(err, "response", None)
+    if not resp:
+        return None
+    try:
+        ra = resp.headers.get("Retry-After")
+    except Exception:
+        ra = None
+    if not ra:
+        return None
+    try:
+        return int(float(ra))
+    except ValueError:
+        return None
+
+
+def _make_producer() -> KafkaProducer:
     last_err: Optional[Exception] = None
     for attempt in range(1, 61):  # ~2 minutes max
         try:
@@ -76,24 +88,17 @@ def _make_producer() -> KafkaProducer:
 
 
 def _publish_batch(producer: KafkaProducer, posts: List[RawPost]) -> None:
-    """
-    Publish a batch to Kafka.
-
-    We set Kafka message key = post.post_id
-    so the message identity is stable across retries/restarts.
-    """
     futures = []
     for post in posts:
         payload = to_jsonable_dict(post)
         futures.append(
             producer.send(
                 settings.TOPIC_RAW_POSTS,
-                key=post.post_id,     # idempotent-ish key
+                key=post.post_id,
                 value=payload,
             )
         )
 
-    # Force delivery + surface errors
     for f in futures:
         f.get(timeout=30)
 
@@ -101,21 +106,15 @@ def _publish_batch(producer: KafkaProducer, posts: List[RawPost]) -> None:
 
 
 def main() -> None:
-    poll_s = int(os.getenv("COLLECTOR_POLL_SECONDS", "30"))
-    reddit_limit = int(os.getenv("REDDIT_LIMIT_PER_SUBREDDIT", "50"))
-    news_page_size = int(os.getenv("NEWS_PAGE_SIZE", "50"))
-
-    # Cursor store in Postgres
     cursor_store = CursorStore(settings.DATABASE_URL_SYNC)
-
-    # Kafka producer
     producer = _make_producer()
 
-    # ---- Reddit client (optional) ----
+    # ---- Reddit (optional) ----
     reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
     reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
     reddit_user_agent = os.getenv("REDDIT_USER_AGENT", "stock-emotional-analysis/0.1 (by u/your_username)")
     reddit_subreddits = _split_csv(os.getenv("REDDIT_SUBREDDITS", ""))
+    reddit_limit = _get_int("REDDIT_LIMIT_PER_SUBREDDIT", 50)
 
     reddit: Optional[RedditAPI] = None
     if reddit_client_id and reddit_client_secret and reddit_subreddits:
@@ -130,7 +129,7 @@ def main() -> None:
     else:
         print("[collector] Reddit disabled (missing env vars or subreddits).")
 
-    # ---- News client (optional) ----
+    # ---- News (optional) ----
     news_api_key = os.getenv("NEWS_API_KEY")
     news_queries = _split_csv(os.getenv("NEWS_QUERIES", ""))
 
@@ -141,11 +140,38 @@ def main() -> None:
     else:
         print("[collector] News disabled (missing NEWS_API_KEY or NEWS_QUERIES).")
 
-    print(f"[collector] Started. Poll interval={poll_s}s. Producing to topic={settings.TOPIC_RAW_POSTS}")
+    # ---- Scheduling + throttles ----
+    reddit_poll_s = _poll_seconds("reddit")
+    news_poll_s = _poll_seconds("news")
+
+    # News caps
+    news_page_size = _get_int("NEWS_PAGE_SIZE", 20)
+    news_max_queries_per_poll = _get_int("NEWS_MAX_QUERIES_PER_POLL", 2)
+    news_max_articles_per_poll = _get_int("NEWS_MAX_ARTICLES_PER_POLL", 200)
+
+    # Rate limit backoff
+    backoff_base = _get_int("NEWS_BACKOFF_BASE_SECONDS", 30)
+    backoff_max = _get_int("NEWS_BACKOFF_MAX_SECONDS", 1800)
+
+    print(
+        f"[collector] Started. mode={_mode()} "
+        f"reddit_every={reddit_poll_s}s news_every={news_poll_s}s "
+        f"news_page_size={news_page_size} max_queries_per_poll={news_max_queries_per_poll} "
+        f"max_articles_per_poll={news_max_articles_per_poll} Producing to topic={settings.TOPIC_RAW_POSTS}"
+    )
+
+    next_reddit = time.time()
+    next_news = time.time()
+
+    news_backoff_until = 0.0
+    news_backoff_s = backoff_base
+    news_q_idx = 0  # rotate queries
 
     while True:
+        now = time.time()
+
         # ---------------- Reddit ingestion ----------------
-        if reddit:
+        if reddit and now >= next_reddit:
             try:
                 for sr in reddit_subreddits:
                     key = CursorKey(source="reddit", stream_id=f"reddit:{sr}")
@@ -161,41 +187,80 @@ def main() -> None:
                         _publish_batch(producer, posts)
                         print(f"[collector][reddit] published {len(posts)} posts from r/{sr}")
 
-                    # Advance cursor only after publishing succeeds
                     if newest_seen and newest_seen != last_fullname:
                         cursor_store.set_cursor(key, newest_seen)
 
             except Exception as e:
-                # Isolate reddit failures (auth, rate limits, etc.)
                 print(f"[collector][reddit] ERROR: {type(e).__name__}: {e}")
 
+            next_reddit = now + reddit_poll_s
+
         # ---------------- News ingestion ----------------
-        if news:
+        if news and now >= next_news:
             try:
-                # Treat the whole query list as one stream cursor
-                key = CursorKey(source="news", stream_id="news:default")
-                last_iso = cursor_store.get_cursor(key)
+                if now < news_backoff_until:
+                    wait_left = int(news_backoff_until - now)
+                    print(f"[collector][news] backing off for {wait_left}s (rate limited)")
+                else:
+                    picked: List[str] = []
+                    if news_queries:
+                        n = min(news_max_queries_per_poll, len(news_queries))
+                        for _ in range(n):
+                            picked.append(news_queries[news_q_idx % len(news_queries)])
+                            news_q_idx += 1
 
-                articles, newest_iso = news.fetch_new_articles(
-                    queries=news_queries,
-                    since_iso=last_iso,
-                    page_size=news_page_size,
-                    language="en",
-                )
+                    total_published = 0
 
-                if articles:
-                    _publish_batch(producer, articles)
-                    print(f"[collector][news] published {len(articles)} articles")
+                    key = CursorKey(source="news", stream_id="news:default")
+                    last_iso = cursor_store.get_cursor(key)
+                    newest_iso_overall = last_iso
 
-                if newest_iso and newest_iso != last_iso:
-                    cursor_store.set_cursor(key, newest_iso)
+                    for q in picked:
+                        if total_published >= news_max_articles_per_poll:
+                            break
+
+                        articles, newest_iso = news.fetch_new_articles(
+                            queries=[q],            # IMPORTANT: one query at a time
+                            since_iso=last_iso,
+                            page_size=news_page_size,
+                            language="en",
+                        )
+
+                        if articles:
+                            remaining = news_max_articles_per_poll - total_published
+                            articles = articles[:remaining]
+
+                            _publish_batch(producer, articles)
+                            total_published += len(articles)
+                            print(f"[collector][news] published {len(articles)} articles for query={q!r}")
+
+                        if newest_iso and (newest_iso_overall is None or newest_iso > newest_iso_overall):
+                            newest_iso_overall = newest_iso
+
+                    print(f"[collector][news] cycle done. total_published={total_published}")
+
+                    if newest_iso_overall and newest_iso_overall != last_iso:
+                        cursor_store.set_cursor(key, newest_iso_overall)
+
+                    news_backoff_s = backoff_base
 
             except Exception as e:
-                # Isolate news failures (bad key, quota, etc.)
-                print(f"[collector][news] ERROR: {type(e).__name__}: {e}")
+                if _is_429(e):
+                    ra = _retry_after_seconds(e)
+                    if ra is not None:
+                        wait_s = ra
+                    else:
+                        wait_s = min(backoff_max, news_backoff_s) + random.randint(0, 10)
+                        news_backoff_s = min(backoff_max, max(news_backoff_s * 2, backoff_base))
 
-        time.sleep(poll_s)
+                    news_backoff_until = time.time() + wait_s
+                    print(f"[collector][news] ERROR 429. Backing off {wait_s}s")
+                else:
+                    print(f"[collector][news] ERROR: {type(e).__name__}: {e}")
 
+            next_news = now + news_poll_s
+
+        time.sleep(1)
 
 
 if __name__ == "__main__":
