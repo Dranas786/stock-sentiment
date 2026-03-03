@@ -46,7 +46,7 @@ class CursorStore:
             )
             conn.commit()
 
-    # get cursor edit
+    # get cursor edit1 (sample)
     def get_cursor(self, key: CursorKey) -> Optional[str]:
         with psycopg.connect(self._dsn) as conn, conn.cursor() as cur:
             cur.execute(
